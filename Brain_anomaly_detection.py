@@ -3,7 +3,6 @@ import os
 import numpy as np
 import random
 import torch
-print(torch.cuda.is_available())
 import torch.nn as nn
 from scipy.ndimage import distance_transform_edt
 import torch.nn.functional as F
@@ -16,11 +15,12 @@ import matplotlib.pyplot as plt
 from sklearn.model_selection import KFold
 
 TRAINPROP = 0.8
-TESTPROP = 0.2
+VALPROP = 0.1
+TESTPROP = 0.1
 BATCHSIZE = 16
 LEARNING_RATE = 0.001
 MOMENTUM = 0.9
-EPOCHS = 15
+EPOCHS = 30
 NUM_FOLDS = 5
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -46,8 +46,6 @@ class CustomDataset(Dataset):
     self.image = 1/255*cv2.imread(os.path.join(self.folder_path, self.name[idx].replace("_mask.tif",".tif")),cv2.IMREAD_GRAYSCALE)[:,:]
 
     return (torch.tensor(self.image, dtype = torch.float).unsqueeze(0), torch.tensor(self.mask, dtype = torch.float).unsqueeze(0), self.name[idx])
-
-
 
 class UNet(nn.Module):
     def __init__(self, in_channels=1, out_channels=1):
@@ -75,7 +73,7 @@ class UNet(nn.Module):
 
         self.sigmoid = nn.Sigmoid()
 
-        #self._initialize_weights()
+        self._initialize_weights()
 
     def contracting_block(self, in_channels, out_channels,size):
         block = nn.Sequential(
@@ -151,6 +149,65 @@ class UNet(nn.Module):
         out = self.sigmoid(out)
 
         return out
+
+class EarlyStopping:
+    def __init__(self, monitor='val_loss', patience=5, restore_best_weights=True):
+        self.monitor = monitor
+        self.patience = patience
+        self.restore_best_weights = restore_best_weights
+        self.best_score = None
+        self.counter = 0
+        self.early_stop = False
+        self.best_model_weights = None
+
+    def __call__(self, model, current_score, current_epoch):
+        if self.best_score is None or current_score < self.best_score:
+            self.best_score = current_score
+            self.counter = 0
+            if self.restore_best_weights:
+                self.best_model_weights = {k: v.clone() for k, v in model.state_dict().items()}
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+                if self.restore_best_weights and self.best_model_weights:
+                    model.load_state_dict(self.best_model_weights)
+    
+class ReduceLROnPlateau:
+    def __init__(self, optimizer, monitor='val_loss', factor=0.1, patience=5, min_lr=1e-5):
+        self.optimizer = optimizer
+        self.monitor = monitor
+        self.factor = factor
+        self.patience = patience
+        self.min_lr = min_lr
+        self.best_score = None
+        self.counter = 0
+
+    def __call__(self, current_score):
+        if self.best_score is None or current_score < self.best_score:
+            self.best_score = current_score
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                for param_group in self.optimizer.param_groups:
+                    new_lr = max(param_group['lr'] * self.factor, self.min_lr)
+                    if param_group['lr'] > new_lr:
+                        param_group['lr'] = new_lr
+                        print(f"Reduced learning rate to {new_lr:.6f} \n")
+
+class ModelCheckpoint:
+    def __init__(self, filepath, monitor='val_loss', save_best_only=True):
+        self.filepath = filepath
+        self.monitor = monitor
+        self.save_best_only = save_best_only
+        self.best_score = None
+
+    def __call__(self, model, current_score):
+        if not self.save_best_only or self.best_score is None or current_score < self.best_score:
+            self.best_score = current_score
+            torch.save(model.state_dict(), self.filepath)
+            print(f"Model saved to {self.filepath} \n")
  
 ################ Functions ###############################################################################################################################
 
@@ -178,6 +235,7 @@ def total_loss(y_true, y_pred, smooth=1):
 dt = CustomDataset()
 idx_P = []
 idx_N = []
+
 for idx in range(dt.__len__()):
     mask = dt.__getitem__(idx)[1]
     r = np.array(mask[:,:])
@@ -191,48 +249,81 @@ list_idx = random.sample(idx_N, len(idx_P)) + idx_P
 #Create a subset dataset to equilibrate the dataset
 equil_dt = Subset(dt, list_idx)
 
-train_ds, test_ds = random_split(equil_dt, [TRAINPROP, TESTPROP])
+train_ds, val_ds, test_ds = random_split(equil_dt, [TRAINPROP, VALPROP, TESTPROP])
 
-my_nn = UNet().to(device)
-print(my_nn)
+unet = UNet().to(device)
+print(unet)
 
 criterion = total_loss
 
-optimizer = optim.Adam(my_nn.parameters(), lr=LEARNING_RATE)
+optimizer = optim.Adam(unet.parameters(), lr=LEARNING_RATE)
 scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
 
-################ Trains ###############################################################################################################################
+################ Trains & Validation ###############################################################################################################################
 
 # Define data loaders for training and validation
 train_dl = DataLoader(train_ds, batch_size=BATCHSIZE, shuffle=True)
+val_dl = DataLoader(val_ds, batch_size=BATCHSIZE, shuffle=True)
+
+# Instantiate callbacks
+early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+reduce_lr = ReduceLROnPlateau(optimizer, monitor='val_loss', factor=0.1, patience=5, min_lr=0.0001)
+checkpoint = ModelCheckpoint('unet_model.pth', monitor='val_loss', save_best_only=True)
 
 # Visualization list and flag for saving the label
 ref_name = ''
 name_saved = False
 
 for epoch in range(EPOCHS):
-    running_loss = 0.0
-    running_dice_coeff = []
+    training_loss = 0.0
+    training_dice_coeff = []
     dataloader = tqdm(train_dl, position=0, leave=True)
 
+    # Training Phase
+    unet.train()
     for inputs, labels, name in dataloader:
         optimizer.zero_grad()
         inputs, labels = inputs.to(device), labels.to(device)
-        outputs = my_nn(inputs)
+        outputs = unet(inputs)
         
         loss = criterion(labels, outputs)
         loss.backward()
         optimizer.step()
 
-        running_loss += loss.item()
-        running_dice_coeff.append(dice_coefficient(labels, outputs).item())
+        training_loss += loss.item()
+        training_dice_coeff.append(dice_coefficient(labels, outputs).item())
 
-        dataloader.set_description(f'Epoch {epoch + 1}/{EPOCHS}, Loss: {running_loss / len(train_dl):.5f} - Dice Coefficient: {100 * sum(running_dice_coeff) / len(running_dice_coeff):.1f}%')
+        dataloader.set_description(f'Epoch {epoch + 1}/{EPOCHS}, Loss: {training_loss / len(train_dl):.5f} - Mean Training Dice Coefficient: {100 * sum(training_dice_coeff) / len(training_dice_coeff):.1f}%')
         dataloader.refresh()
     
     scheduler.step()
+    dataloader.close()
+
+    # Validation Phase
+    unet.eval()
+    val_loss = 0.0
+    val_dice_coeff = []
+    with torch.no_grad():
+        for inputs, labels, name in val_dl:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = unet(inputs)
+            loss = criterion(labels, outputs)
+
+            val_loss += loss.item()
+            val_dice_coeff.append(dice_coefficient(labels, outputs).item())
+        
+        print(f'Epoch {epoch + 1}/{EPOCHS}, Loss: {val_loss / len(val_dl):.5f} - Mean Validation Dice Coefficient: {100 * sum(val_dice_coeff) / len(val_dice_coeff):.1f}% \n')
 
     dataloader.close()
+
+    # Callbacks
+    early_stopping(unet, val_loss, epoch)
+    reduce_lr(val_loss)
+    checkpoint(unet, val_loss)
+
+    if early_stopping.early_stop:
+        print("Early stopping triggered.")
+        break
 
 print('Training finished')
 
@@ -240,14 +331,14 @@ print('Training finished')
 
 test_dl = DataLoader(test_ds, batch_size=BATCHSIZE, shuffle=True)
 
-my_nn.eval()
-val_dice_coeff = []
+unet.eval()
+test_dice_coeff = []
 example_showed = False
 k = 0
 for inputs, labels , name in test_dl:
     inputs, labels = inputs.to(device), labels.to(device)
-    outputs = my_nn(inputs)
-    val_dice_coeff.append(dice_coefficient(labels, outputs).item())
+    outputs = unet(inputs)
+    test_dice_coeff.append(dice_coefficient(labels, outputs).item())
     
 
 
@@ -281,13 +372,12 @@ for inputs, labels , name in test_dl:
 
         plt.show()
 
-        print(dice_coefficient(outputs, labels).item())
+        print(f"Image's Dice Coefficient: {100*dice_coefficient(outputs, labels).item():.1f} %")
 
         example_showed = True
 
 
 
 dataloader.close()
-print(f'Mean Dice Coefficient: {100 * sum(val_dice_coeff) / len(val_dice_coeff):.1f}%')
+print(f'Mean Test Dice Coefficient: {100 * sum(test_dice_coeff) / len(test_dice_coeff):.1f}%')
 
-torch.save(my_nn.state_dict(), 'unet_model.pth')
