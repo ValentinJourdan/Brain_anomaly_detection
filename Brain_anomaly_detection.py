@@ -17,6 +17,8 @@ from sklearn.model_selection import KFold
 TRAINPROP = 0.8
 VALPROP = 0.1
 TESTPROP = 0.1
+DICE_PROP = 0.8
+SMOOTH = 0.5
 BATCHSIZE = 16
 LEARNING_RATE = 0.001
 MOMENTUM = 0.9
@@ -173,29 +175,6 @@ class EarlyStopping:
                 if self.restore_best_weights and self.best_model_weights:
                     model.load_state_dict(self.best_model_weights)
     
-class ReduceLROnPlateau:
-    def __init__(self, optimizer, monitor='val_loss', factor=0.1, patience=5, min_lr=1e-5):
-        self.optimizer = optimizer
-        self.monitor = monitor
-        self.factor = factor
-        self.patience = patience
-        self.min_lr = min_lr
-        self.best_score = None
-        self.counter = 0
-
-    def __call__(self, current_score):
-        if self.best_score is None or current_score < self.best_score:
-            self.best_score = current_score
-            self.counter = 0
-        else:
-            self.counter += 1
-            if self.counter >= self.patience:
-                for param_group in self.optimizer.param_groups:
-                    new_lr = max(param_group['lr'] * self.factor, self.min_lr)
-                    if param_group['lr'] > new_lr:
-                        param_group['lr'] = new_lr
-                        print(f"Reduced learning rate to {new_lr:.6f} \n")
-
 class ModelCheckpoint:
     def __init__(self, filepath, monitor='val_loss', save_best_only=True):
         self.filepath = filepath
@@ -212,21 +191,21 @@ class ModelCheckpoint:
 ################ Functions ###############################################################################################################################
 
 #Defining the Dice Loss
-def dice_coefficient_proba(y_true, y_pred, smooth=1):
+def dice_coefficient_proba(y_true, y_pred, smooth=SMOOTH):
     intersection = torch.sum(y_true * y_pred)
     union = torch.sum(y_true) + torch.sum(y_pred)
     dice = (2. * intersection + smooth) / (union + smooth)
     return dice
 
-def dice_coefficient(y_true, y_pred, smooth=1):
+def dice_coefficient(y_true, y_pred, smooth=SMOOTH):
     y_pred = (y_pred  > 0.5).float()
     intersection = torch.sum(y_true * y_pred)
     union = torch.sum(y_true) + torch.sum(y_pred)
     dice = (2. * intersection + smooth) / (union + smooth)
     return dice
 
-def total_loss(y_true, y_pred, smooth=1):
-    loss = 0.8*(1 - dice_coefficient_proba(y_true, y_pred, smooth)) + 0.2*nn.BCELoss()(y_pred, y_true)
+def total_loss(y_true, y_pred, smooth=SMOOTH):
+    loss = DICE_PROP*(1 - dice_coefficient_proba(y_true, y_pred, smooth)) + (1-DICE_PROP)*nn.BCELoss()(y_pred, y_true)
     return loss
 
 ######################################################################################################################################################
@@ -267,7 +246,6 @@ val_dl = DataLoader(val_ds, batch_size=BATCHSIZE, shuffle=True)
 
 # Instantiate callbacks
 early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
-reduce_lr = ReduceLROnPlateau(optimizer, monitor='val_loss', factor=0.1, patience=5, min_lr=0.0001)
 checkpoint = ModelCheckpoint('unet_model.pth', monitor='val_loss', save_best_only=True)
 
 # Visualization list and flag for saving the label
@@ -275,8 +253,8 @@ ref_name = ''
 name_saved = False
 
 for epoch in range(EPOCHS):
-    training_loss = 0.0
-    training_dice_coeff = []
+    train_loss = []
+    train_dice_coeff = []
     dataloader = tqdm(train_dl, position=0, leave=True)
 
     # Training Phase
@@ -290,18 +268,20 @@ for epoch in range(EPOCHS):
         loss.backward()
         optimizer.step()
 
-        training_loss += loss.item()
-        training_dice_coeff.append(dice_coefficient(labels, outputs).item())
+        train_loss.append(loss.item())
+        train_dice_coeff.append(dice_coefficient(labels, outputs).item())
 
-        dataloader.set_description(f'Epoch {epoch + 1}/{EPOCHS}, Loss: {training_loss / len(train_dl):.5f} - Mean Training Dice Coefficient: {100 * sum(training_dice_coeff) / len(training_dice_coeff):.1f}%')
+        dataloader.set_description(f'Epoch {epoch + 1}/{EPOCHS}, Loss: {sum(train_loss) / len(train_loss):.5f} - Mean Training Dice Coefficient: {100 * sum(train_dice_coeff) / len(train_dice_coeff):.1f}%')        
         dataloader.refresh()
-    
+
     scheduler.step()
     dataloader.close()
+    del train_loss
+    del train_dice_coeff
 
     # Validation Phase
     unet.eval()
-    val_loss = 0.0
+    val_loss = []
     val_dice_coeff = []
     with torch.no_grad():
         for inputs, labels, name in val_dl:
@@ -309,17 +289,19 @@ for epoch in range(EPOCHS):
             outputs = unet(inputs)
             loss = criterion(labels, outputs)
 
-            val_loss += loss.item()
+            val_loss.append(loss.item())
             val_dice_coeff.append(dice_coefficient(labels, outputs).item())
         
-        print(f'Epoch {epoch + 1}/{EPOCHS}, Loss: {val_loss / len(val_dl):.5f} - Mean Validation Dice Coefficient: {100 * sum(val_dice_coeff) / len(val_dice_coeff):.1f}% \n')
+        mean_val_loss = sum(val_loss) / len(val_loss)
+        print(f'Epoch {epoch + 1}/{EPOCHS}, Loss: {mean_val_loss:.5f} - Mean Validation Dice Coefficient: {100 * sum(val_dice_coeff) / len(val_dice_coeff):.1f}% \n')
 
     dataloader.close()
+    del val_loss
+    del val_dice_coeff
 
     # Callbacks
-    early_stopping(unet, val_loss, epoch)
-    reduce_lr(val_loss)
-    checkpoint(unet, val_loss)
+    early_stopping(unet, mean_val_loss, epoch)
+    checkpoint(unet, mean_val_loss)
 
     if early_stopping.early_stop:
         print("Early stopping triggered.")
@@ -328,6 +310,10 @@ for epoch in range(EPOCHS):
 print('Training finished')
 
 ################ Test ###############################################################################################################################
+
+# Load the best model
+unet = UNet().to(device)  
+unet.load_state_dict(torch.load('unet_model.pth', weights_only=True))
 
 test_dl = DataLoader(test_ds, batch_size=BATCHSIZE, shuffle=True)
 
@@ -375,7 +361,6 @@ for inputs, labels , name in test_dl:
         print(f"Image's Dice Coefficient: {100*dice_coefficient(outputs, labels).item():.1f} %")
 
         example_showed = True
-
 
 
 dataloader.close()
