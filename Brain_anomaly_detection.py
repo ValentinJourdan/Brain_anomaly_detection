@@ -52,14 +52,13 @@ class CustomDataset(Dataset):
 class UNet(nn.Module):
     def __init__(self, in_channels=1, out_channels=1):
         super(UNet, self).__init__()
-
+        
         # Encoder
         self.enc1 = self.contracting_block(in_channels, 32,5)
-        self.enc2 = self.contracting_block(32, 64,3)
-        self.enc3 = self.contracting_block(64, 128,3)
-        self.enc4 = self.contracting_block(128, 256,3)
-        self.enc5 = self.contracting_block(256, 512,3)
-        #self.drop = nn.Dropout(p=0.1)
+        self.enc2 = self.contracting_block(32, 64,3,2) # Use strided convolution instead of Maxpool
+        self.enc3 = self.contracting_block(64, 128,3,2)
+        self.enc4 = self.contracting_block(128, 256,3,2)
+        self.enc5 = self.contracting_block(256, 512,3,2)
 
         # Decoder
         self.upconv4 = self.upconv(512, 256)
@@ -77,9 +76,9 @@ class UNet(nn.Module):
 
         self._initialize_weights()
 
-    def contracting_block(self, in_channels, out_channels,size):
+    def contracting_block(self, in_channels, out_channels,size,stride=1):
         block = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=size, padding='same'),
+            nn.Conv2d(in_channels, out_channels, kernel_size=size,stride=stride, padding='same'),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
             nn.Dropout(p=0.1),
@@ -98,12 +97,13 @@ class UNet(nn.Module):
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding='same'),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
-            
         )
         return block
 
+
     def upconv(self, in_channels, out_channels):
         return nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
+
 
     def crop_and_concat(self, upsampled, bypass, crop=False):
         if crop:
@@ -121,12 +121,10 @@ class UNet(nn.Module):
     def forward(self, x):
         # Encoder
         enc1 = self.enc1(x)
-        enc2 = self.enc2(F.max_pool2d(enc1, 2))
-        enc3 = self.enc3(F.max_pool2d(enc2, 2))
-        #enc3 = self.drop(enc3)
-        enc4 = self.enc4(F.max_pool2d(enc3, 2))
-        enc5 = self.enc5(F.max_pool2d(enc4, 2))
-        #enc5 = self.drop(enc5)
+        enc2 = self.enc2(enc1)
+        enc3 = self.enc3(enc2)
+        enc4 = self.enc4(enc3)
+        enc5 = self.enc5(enc4)        
 
         # Decoder
         dec4 = self.upconv4(enc5)
@@ -136,7 +134,6 @@ class UNet(nn.Module):
         dec3 = self.upconv3(dec4)
         dec3 = self.crop_and_concat(dec3, enc3, crop=True)
         dec3 = self.dec3(dec3)
-        #dec3 = self.drop(dec3)
 
         dec2 = self.upconv2(dec3)
         dec2 = self.crop_and_concat(dec2, enc2, crop=True)
@@ -147,7 +144,6 @@ class UNet(nn.Module):
         dec1 = self.dec1(dec1)
 
         out = self.final_conv(dec1)
-        #out = self.drop(out)
         out = self.sigmoid(out)
 
         return out
